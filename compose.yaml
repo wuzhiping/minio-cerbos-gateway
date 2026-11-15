@@ -1,0 +1,15 @@
+services:
+  minio-cerbos-gateway:
+    build: .
+    container_name: minio-cerbos-gateway
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:8088:8080"
+    networks:
+      - storage
+
+networks:
+  storage:
+    external: true
