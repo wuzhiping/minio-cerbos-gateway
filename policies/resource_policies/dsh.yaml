@@ -1,0 +1,30 @@
+apiVersion: api.cerbos.dev/v1
+resourcePolicy:
+  version: default
+  resource: dsh
+  rules:
+    # The whole dsh bucket is world-readable for anonymous principals.
+    - actions: ["read"]
+      effect: EFFECT_ALLOW
+      roles: ["anonymous"]
+      condition:
+        match:
+          expr: request.resource.attr.bucket == "dsh"
+
+    # Authenticated users can read only within their assigned path prefix.
+    - actions: ["read"]
+      effect: EFFECT_ALLOW
+      roles: ["user"]
+      condition:
+        match:
+          expr: request.resource.attr.bucket == "dsh" &&
+            request.principal.attr.path_prefix != "" &&
+            request.resource.attr.key.startsWith(request.principal.attr.path_prefix)
+
+    # Admin can read any object in the dsh bucket.
+    - actions: ["read"]
+      effect: EFFECT_ALLOW
+      roles: ["admin"]
+      condition:
+        match:
+          expr: request.resource.attr.bucket == "dsh"

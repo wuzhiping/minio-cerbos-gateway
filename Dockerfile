@@ -10,6 +10,7 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && useradd --create-home --uid 10001 gateway
 
 COPY app ./app
+COPY .env.example ./.env.example
 RUN chown -R gateway:gateway /app
 USER gateway
 

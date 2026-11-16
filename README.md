@@ -17,6 +17,8 @@
 ```text
 app/main.py
 policies/resource_policies/minio_object.yaml
+policies/resource_policies/aife.yaml
+policies/resource_policies/dsh.yaml
 Dockerfile
 compose.yaml
 .env.example
@@ -25,28 +27,79 @@ requirements.txt
 
 ## 启动
 
-1. 将本目录的 `policies/` 合并到 Cerbos PDP 的策略目录。
-2. 确认 Cerbos 与 MinIO 容器都加入 Docker 网络 `storage`，或修改 `compose.yaml`
-   中网络名称。
-3. `cp .env.example .env`，填写 MinIO 专用只读账号及正确 endpoint。
-4. `docker compose up -d --build`
+1. 将本目录的 `policies/` 部署到 Cerbos PDP（`POST /admin/policy`，请求体
+   `{"policies": [<策略文档>]}`），或合并到 PDP 的策略目录。
+2. 按需修改 `.env.example`（`compose.yaml` 直接以它作为 `env_file`，默认配置即可运行）：
+   Cerbos 地址、MinIO endpoint、bucket→资源名映射、路径前缀、MinIO 凭据（见“MinIO 访问模式”）。
+3. `docker compose up -d --build`
 
-Gateway 绑定 `127.0.0.1:8088`，建议由 Nginx 在本机反向代理，不要直接暴露公网。
+### 配置来源与优先级
+
+Gateway 自身会读取项目根目录的 `.env.example`（以及可选的 `.env`），因此脱离
+compose 直接运行也能生效。优先级从高到低：
+
+1. 进程环境变量
+2. `.env`
+3. `.env.example`
+4. 代码内置默认值
+
+默认 `MINIO_ENDPOINT` 为 `https://oss.feg.cn`，默认 `MINIO_SECURE` 留空并跟随 endpoint
+协议（`https://` → `true`，`http://` → `false`）；显式设置 `MINIO_SECURE` 时以显式值为准。
+
+默认 Cerbos 与 MinIO 都是外部服务（`http://10.17.1.201:3592`、`https://oss.feg.cn`），
+容器不依赖任何外部 Docker 网络；若把 MinIO / Cerbos 改为同机容器，需在
+`compose.yaml` 中补回 `networks` 并把两者加入同一网络。
+
+Gateway 默认监听 `0.0.0.0:8088`（`compose.yaml` 中 `"8088:8080"`）。Gateway 完全信任
+`X-Auth-*` 身份头，因此**必须**由防火墙/安全组限制只有可信反向代理能访问该端口，
+否则任何能连上的人都可以自行声明身份（如 `X-Auth-Roles: admin`）。
+如需仅本机访问，把端口映射改为 `"127.0.0.1:8088:8080"`。
+
+### 路径前缀
+
+`root_path` 决定网关挂载的路径前缀，默认 `/share/s3`（来自 `.env.example`，
+取值带不带前导斜杠均可）。带前缀与不带前缀的 URL 都会被正确路由，例如
+`/share/s3/aife/4KI/STORY.html` 与 `/aife/4KI/STORY.html` 等价，
+Swagger 文档位于 `/share/s3/docs`。
 
 ## Policy 示例
 
-- anonymous：允许任意 Bucket 中 `public/` 前缀下的对象。
+策略按「资源名」划分，一个文件一个资源名（不使用 scope）：
+
+| 策略文件 | 资源名 | 适用 bucket | anonymous |
+|----------|--------|-------------|-----------|
+| `minio_object.yaml` | `minio_object` | 未单独配置策略的 bucket | 仅 `public/` 前缀 |
+| `aife.yaml` | `aife` | `aife` | 整个 bucket 全部可读 |
+| `dsh.yaml` | `dsh` | `dsh` | 整个 bucket 全部可读 |
+
+每个策略都包含三类角色：
+
+- anonymous：`aife`/`dsh` 为整个 bucket 全部可读；`minio_object` 仅允许 `public/` 前缀。
 - user：只允许 `X-Auth-Path-Prefix` 指定前缀下的对象。
 - admin：允许读取任意对象。
 - 未命中 allow 规则：Cerbos 默认拒绝。
 
+Gateway 按 bucket 选择资源名，由 `CERBOS_BUCKET_KINDS` 决定（格式 `bucket=kind`），
+未列出的 bucket 使用 `CERBOS_RESOURCE_KIND`（默认 `minio_object`）：
+
+```bash
+CERBOS_BUCKET_KINDS=aife=aife,dsh=dsh
+CERBOS_RESOURCE_KIND=minio_object
+```
+
+映射到的资源名必须在 PDP 中存在对应策略，否则该 bucket 的请求会被 Cerbos 拒绝
+（未知资源名返回 `EFFECT_DENY`，网关表现为 403）。
+部署策略：`POST /admin/policy`，请求体为 `{"policies": [<策略文档>]}`。
+
 例如 anonymous 可以读取：
 
-`GET /aife/public/index.html`
+`GET /aife/public/index.html`（minio_object 规则）
 
-anonymous 不能读取：
+`GET /aife/4KI/STORY.html`（aife 规则，整桶可读）
 
-`GET /aife/4KI/STORY.html`
+anonymous 不能读取（bucket 未配置专用策略时）：
+
+`GET /other/4KI/STORY.html`
 
 ## 身份头安全要求
 
@@ -57,10 +110,37 @@ OIDC/auth_request 等可信机制注入身份。不要让用户能够直接访�
 未提供 `X-Auth-User` 时，Gateway 使用 anonymous。提供用户身份但未提供角色时，
 默认角色为 `user`。生产环境应由认证代理提供角色和 path prefix，不能允许用户自行指定。
 
+## 客户端 IP
+
+Gateway 会把客户端 IP 放入 `principal.attr.ip`，策略中可用
+`request.principal.attr.ip` 做条件判断。
+
+取值顺序：请求头 `X-Forwarded-For` 的第一段 → TCP 对端地址（`request.client.host`）。
+由于 `X-Forwarded-For` 可被客户端伪造，可信代理必须**覆盖**该头
+（Nginx 用 `proxy_set_header X-Forwarded-For $remote_addr;`，不要用会追加的
+`$proxy_add_x_forwarded_for`），否则 IP 条件可被绕过。
+
+## MinIO 访问模式
+
+Gateway 支持两种访问 MinIO 的方式，由环境变量决定：
+
+| 模式 | 条件 | 说明 |
+|------|------|------|
+| 签名访问 | `MINIO_ACCESS_KEY` 与 `MINIO_SECRET_KEY` 都非空 | Gateway 用该账号签名访问 MinIO |
+| 匿名访问 | 上述两项为空（或只填了一项） | Gateway 发送 unsigned 请求，MinIO 按自身桶策略判定 |
+
+- 匿名模式下不发送 `Authorization` 头，MinIO 侧必须另行给桶配置匿名读策略
+  （例如允许 `public/` 前缀匿名 GET/HEAD），否则 MinIO 返回 `AccessDenied`，
+  Gateway 转为 `403 Access denied by storage backend`；其余存储错误转为
+  `502 Storage backend error`。
+- 只填了 access key 或只填了 secret key 时同样按匿名访问处理，并打印告警日志。
+- 两种模式下 Cerbos 授权流程完全一致：是否允许访问由策略决定，与 MinIO 凭据无关。
+
 ## Nginx 代理示例
 
 ```nginx
-location / {
+# 路径前缀与 Gateway 的 root_path 保持一致（默认 /share/s3）
+location /share/s3/ {
     # 此处应先执行真实认证；以下变量应由认证子请求返回。
     auth_request /_auth;
     auth_request_set $auth_user $upstream_http_x_auth_user;
@@ -71,6 +151,9 @@ location / {
     proxy_set_header X-Auth-Roles $auth_roles;
     proxy_set_header X-Auth-Path-Prefix $auth_prefix;
 
+    # 覆盖客户端传入的 X-Forwarded-For，Gateway 据此设置 principal.attr.ip。
+    proxy_set_header X-Forwarded-For $remote_addr;
+
     # 不透传客户端伪造的身份头；由上面的可信变量覆盖。
     proxy_pass http://127.0.0.1:8088;
 }
@@ -80,11 +163,17 @@ location / {
 
 ## 测试
 
-匿名请求（根据策略，只有 public/ 可访问）：
+匿名请求（`aife`/`dsh` 为整桶可读）：
 
 ```bash
-curl -i http://127.0.0.1:8088/aife/public/index.html
-curl -i http://127.0.0.1:8088/aife/4KI/STORY.html
+curl -i http://127.0.0.1:8088/share/s3/aife/4KI/STORY.html
+curl -i http://127.0.0.1:8088/share/s3/dsh/4KI/HANDOFF.md
+```
+
+未配置专用策略的 bucket 只有 `public/` 前缀可访问：
+
+```bash
+curl -i http://127.0.0.1:8088/share/s3/other/public/index.html
 ```
 
 认证用户示例（仅在可信代理正确注入身份时使用）：
@@ -94,13 +183,13 @@ curl -i \
   -H 'X-Auth-User: alice' \
   -H 'X-Auth-Roles: user' \
   -H 'X-Auth-Path-Prefix: 4KI/' \
-  http://127.0.0.1:8088/aife/4KI/STORY.html
+  http://127.0.0.1:8088/share/s3/aife/4KI/STORY.html
 ```
 
 ## 生产注意事项
 
 - MinIO 原始 S3 API 不应对终端用户开放；网络层确保只能经 Gateway 访问。
-- MinIO 凭据使用独立的最小权限只读 Service Account。
+- 签名模式下 MinIO 凭据使用独立的最小权限只读 Service Account；匿名模式下依赖桶策略收敛读范围。
 - 当前实现是对象读取网关，不是完整 S3 API 兼容代理。
 - ListObjects、写入、删除、预签名 URL、multipart upload 等必须单独设计授权。
 - 生产部署建议补充 JWT/OIDC 验证、审计日志、速率限制、并发控制和对象大小限制。
