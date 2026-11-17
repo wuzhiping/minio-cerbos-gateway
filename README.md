@@ -136,6 +136,62 @@ Gateway 支持两种访问 MinIO 的方式，由环境变量决定：
 - 只填了 access key 或只填了 secret key 时同样按匿名访问处理，并打印告警日志。
 - 两种模式下 Cerbos 授权流程完全一致：是否允许访问由策略决定，与 MinIO 凭据无关。
 
+## 性能与并发
+
+### 架构要点
+
+- 所有对 MinIO 的调用都是阻塞式的（boto3），因此**不能**在事件循环里直接调用。
+  网关用 `anyio.to_thread.run_sync` 把 `head_object` / `get_object` / `body.read`
+  放进线程池，事件循环因此不会被传输中的大文件阻塞。
+- 流式输出是**异步** generator，每个分块只在读取瞬间占用一个线程池令牌
+  （同步 generator 会让每次传输独占一个令牌，默认上限 40/worker）。
+- 每个 worker 是独立进程，各自持有 boto3 连接池与 Cerbos HTTP 连接池。
+
+### 可调参数
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `STREAM_CHUNK_SIZE` | `524288` | 流式分块大小（字节） |
+| `MINIO_MAX_POOL_CONNECTIONS` | `32` | boto3 连接池（默认只有 10） |
+| `THREADPOOL_TOKENS` | `128` | 每 worker 的阻塞调用线程池上限 |
+| `CERBOS_MAX_CONNECTIONS` | `100` | 到 Cerbos 的最大并发连接 |
+| `CACHE_CONTROL` | `private, max-age=300` | 浏览器缓存策略 |
+| `ACCESS_LOG` | `true` | 输出分阶段耗时访问日志 |
+
+worker 数由 Dockerfile 的 `--workers 4` 决定（IO 密集型，按 CPU 调整）。
+
+### 访问日志
+
+每个对象请求输出一行，可据此区分"网关慢"还是"后端慢"：
+
+```
+rid=0d939c0b282e GET dsh/12601-flbzu8.mp4 status=206 cerbos_ms=11.6 minio_ms=273.4 total_ms=422.3 bytes=1024 ip=127.0.0.1
+```
+
+`rid` 同时写入响应头 `X-Request-ID`，客户端可自带该头以便全链路追踪。
+
+### 缓存与条件请求
+
+- `CACHE_CONTROL` 决定浏览器缓存；默认 `private, max-age=300`，
+  MP4 重复播放/拖动进度条可直接命中浏览器缓存，不再回源。
+  **代价**：权限撤销后客户端缓存最多 `max-age` 秒内仍可能命中。
+  设为 `no-store` 可回到"完全不缓存"。
+- 支持 `If-None-Match` → 命中 ETag 返回 **304**（不下发 body）。
+- 支持 `If-Range` → ETag 不匹配时忽略 Range 改发完整对象。
+- Range 不可满足时返回 **416**。
+
+### 性能实测（本机 → `oss.feg.cn`，us-west-rack-2）
+
+| 场景 | 改造前 | 改造后 |
+|------|--------|--------|
+| 8 并发 × 1MB | 2443ms | **1035ms**（4 workers）/ 1296ms（1 worker） |
+| 16 并发 × 1MB | 4037ms | **1637ms**（4 workers）/ 1585ms（1 worker） |
+
+**后端链路是硬上限**：实测 Cerbos 授权往返仅 ~2ms，但对象存储单请求 TTFB ~100ms
+（连 1 字节 Range 也是 101ms），整机出口带宽约 **7MB/s**，且 8/16/32 并发下吞吐
+都不再上升。网关自身的开销已被消除，再加并发也不会更快；
+MP4 的体感提速主要来自浏览器缓存命中。
+
 ## Nginx 代理示例
 
 ```nginx

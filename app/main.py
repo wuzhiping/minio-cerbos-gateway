@@ -1,7 +1,10 @@
 import logging
 import os
+import time
+import uuid
 from urllib.parse import unquote, urlsplit
 
+import anyio
 import boto3
 import httpx
 from botocore import UNSIGNED
@@ -79,6 +82,11 @@ BUCKET_KINDS = parse_bucket_kinds(env("CERBOS_BUCKET_KINDS", ""))
 MINIO_ENDPOINT = env("MINIO_ENDPOINT", "https://oss.feg.cn")
 MINIO_REGION = env("MINIO_REGION", "us-east-1")
 ROOT_PATH = resolve_root_path()
+CHUNK_SIZE = int(env("STREAM_CHUNK_SIZE", str(512 * 1024)))
+CACHE_CONTROL = env("CACHE_CONTROL", "private, max-age=300")
+MINIO_MAX_POOL_CONNECTIONS = int(env("MINIO_MAX_POOL_CONNECTIONS", "32"))
+THREADPOOL_TOKENS = int(env("THREADPOOL_TOKENS", "128"))
+ACCESS_LOG = env("ACCESS_LOG", "true").lower() != "false"
 
 
 def resolve_use_ssl(endpoint: str) -> bool:
@@ -107,12 +115,19 @@ def create_s3_client():
         "region_name": MINIO_REGION,
         "use_ssl": MINIO_SECURE,
     }
+    # botocore defaults to 10 pooled connections and 5 legacy retries, both of
+    # which throttle concurrent transfers.
+    client_config = {
+        "max_pool_connections": MINIO_MAX_POOL_CONNECTIONS,
+        "retries": {"mode": "standard", "max_attempts": 3},
+    }
 
     if access_key and secret_key:
         return boto3.client(
             "s3",
             aws_access_key_id=access_key,
             aws_secret_access_key=secret_key,
+            config=Config(**client_config),
             **common,
         )
 
@@ -125,7 +140,11 @@ def create_s3_client():
     # Anonymous mode: never let botocore look up ambient credentials (IMDS).
     os.environ.setdefault("AWS_EC2_METADATA_DISABLED", "true")
     log.info("MinIO credentials not configured; using anonymous (unsigned) access")
-    return boto3.client("s3", config=Config(signature_version=UNSIGNED), **common)
+    return boto3.client(
+        "s3",
+        config=Config(signature_version=UNSIGNED, **client_config),
+        **common,
+    )
 
 
 s3 = create_s3_client()
@@ -139,7 +158,21 @@ app = FastAPI(
 
 @app.on_event("startup")
 async def startup():
-    app.state.cerbos = httpx.AsyncClient(base_url=CERBOS_URL, timeout=5.0)
+    app.state.cerbos = httpx.AsyncClient(
+        base_url=CERBOS_URL,
+        timeout=5.0,
+        limits=httpx.Limits(
+            max_connections=int(env("CERBOS_MAX_CONNECTIONS", "100")),
+            max_keepalive_connections=int(env("CERBOS_MAX_KEEPALIVE", "50")),
+        ),
+    )
+    # Every blocking MinIO call runs in this pool; the default of 40 tokens
+    # caps the number of transfers a single worker can serve.
+    anyio.to_thread.current_default_thread_limiter().total_tokens = THREADPOOL_TOKENS
+    log.info(
+        "gateway started: root_path=%s cerbos=%s minio=%s chunk=%s cache=%s",
+        ROOT_PATH or "/", CERBOS_URL, MINIO_ENDPOINT, CHUNK_SIZE, CACHE_CONTROL,
+    )
 
 
 @app.on_event("shutdown")
@@ -239,39 +272,106 @@ async def health():
     return {"status": "ok"}
 
 
+def log_access(request: Request, request_id: str, bucket: str, key: str, status: int,
+               storage_ms: float, auth_ms: float, started: float, content_length: int):
+    if not ACCESS_LOG:
+        return
+    total_ms = (time.perf_counter() - started) * 1000
+    log.info(
+        "rid=%s %s %s/%s status=%s cerbos_ms=%.1f minio_ms=%.1f total_ms=%.1f bytes=%s ip=%s",
+        request_id, request.method, bucket, key, status, auth_ms, storage_ms,
+        total_ms, content_length, client_ip(request),
+    )
+
+
+def etag_matches(if_none_match: str, etag: str) -> bool:
+    """Compare an If-None-Match header value against the current ETag."""
+    if not if_none_match or not etag:
+        return False
+    if if_none_match.strip() == "*":
+        return True
+    candidates = {tag.strip().lstrip("W/") for tag in if_none_match.split(",")}
+    return etag.strip().lstrip("W/") in candidates
+
+
 @app.api_route("/{bucket}/{object_key:path}", methods=["GET", "HEAD"])
 async def object_proxy(bucket: str, object_key: str, request: Request):
+    started = time.perf_counter()
+    request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
+
     # FastAPI has already URL-decoded the path. Reject encoded traversal too.
     decoded_key = unquote(object_key)
     validate_bucket_and_key(bucket, decoded_key)
 
     principal = principal_from_request(request)
     action = "read"
+    auth_started = time.perf_counter()
     if not await authorize(principal, bucket, decoded_key, action):
         raise HTTPException(status_code=403, detail="Access denied by Cerbos")
+    auth_ms = (time.perf_counter() - auth_started) * 1000
 
     try:
         if request.method == "HEAD":
-            obj = s3.head_object(Bucket=bucket, Key=decoded_key)
+            storage_started = time.perf_counter()
+            obj = await anyio.to_thread.run_sync(
+                lambda: s3.head_object(Bucket=bucket, Key=decoded_key)
+            )
+            storage_ms = (time.perf_counter() - storage_started) * 1000
             headers = {
                 "Content-Type": obj.get("ContentType", "application/octet-stream"),
                 "Content-Length": str(obj["ContentLength"]),
-                "Cache-Control": "private, no-store",
+                "Cache-Control": CACHE_CONTROL,
+                "X-Request-ID": request_id,
             }
             if obj.get("ETag"):
                 headers["ETag"] = obj["ETag"]
+            log_access(request, request_id, bucket, decoded_key, 200, storage_ms,
+                       auth_ms, started, obj.get("ContentLength", 0))
             return Response(status_code=200, headers=headers)
+
+        # Conditional request: revalidate without downloading the body.
+        if_none_match = request.headers.get("if-none-match", "")
+        if if_none_match:
+            storage_started = time.perf_counter()
+            meta = await anyio.to_thread.run_sync(
+                lambda: s3.head_object(Bucket=bucket, Key=decoded_key)
+            )
+            storage_ms = (time.perf_counter() - storage_started) * 1000
+            etag = meta.get("ETag", "")
+            if etag_matches(if_none_match, etag):
+                headers = {
+                    "ETag": etag,
+                    "Cache-Control": CACHE_CONTROL,
+                    "X-Request-ID": request_id,
+                }
+                log_access(request, request_id, bucket, decoded_key, 304,
+                           storage_ms, auth_ms, started, 0)
+                return Response(status_code=304, headers=headers)
 
         params = {"Bucket": bucket, "Key": decoded_key}
         range_header = request.headers.get("range")
+        if_range = request.headers.get("if-range", "")
         if range_header:
             params["Range"] = range_header
-        obj = s3.get_object(**params)
+
+        storage_started = time.perf_counter()
+        obj = await anyio.to_thread.run_sync(lambda: s3.get_object(**params))
+        storage_ms = (time.perf_counter() - storage_started) * 1000
+
+        # If-Range: when the validator no longer matches, the range is stale and
+        # the full object must be sent instead.
+        if range_header and if_range:
+            validator = if_range.strip().lstrip("W/")
+            current = (obj.get("ETag") or "").strip().lstrip("W/")
+            if validator and current and validator != current:
+                obj["Body"].close()
+                obj = await anyio.to_thread.run_sync(lambda: s3.get_object(**params))
 
         headers = {
             "Content-Type": obj.get("ContentType", "application/octet-stream"),
-            "Cache-Control": "private, no-store",
+            "Cache-Control": CACHE_CONTROL,
             "Accept-Ranges": "bytes",
+            "X-Request-ID": request_id,
         }
         for source, target in (
             ("ContentLength", "Content-Length"),
@@ -283,11 +383,11 @@ async def object_proxy(bucket: str, object_key: str, request: Request):
             if value is not None:
                 headers[target] = str(value)
 
-        def body_iterator():
+        async def body_iterator():
             body = obj["Body"]
             try:
                 while True:
-                    chunk = body.read(256 * 1024)
+                    chunk = await anyio.to_thread.run_sync(body.read, CHUNK_SIZE)
                     if not chunk:
                         break
                     yield chunk
@@ -295,6 +395,9 @@ async def object_proxy(bucket: str, object_key: str, request: Request):
                 body.close()
 
         status = 206 if obj.get("ContentRange") else 200
+        content_length = obj.get("ContentLength", 0)
+        log_access(request, request_id, bucket, decoded_key, status, storage_ms,
+                   auth_ms, started, content_length)
         return StreamingResponse(
             body_iterator(),
             status_code=status,
@@ -310,5 +413,7 @@ async def object_proxy(bucket: str, object_key: str, request: Request):
             raise HTTPException(
                 status_code=403, detail="Access denied by storage backend"
             )
+        if code in {"InvalidRange", "416"}:
+            raise HTTPException(status_code=416, detail="Requested range not satisfiable")
         log.exception("MinIO request failed")
         raise HTTPException(status_code=502, detail="Storage backend error")
